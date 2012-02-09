@@ -1,0 +1,285 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Env;
+use Net::FTP;
+use Time::localtime;
+use lib '/ess/common/perl/lib';
+use Log::Log4perl;
+use lib '/ess/common/perl/lib/Sw';
+use Node;
+#use diagnostics;
+
+# ----------------------------------------------------------------------------
+# do_ftp
+# ----------------------------------------------------------------------------
+sub do_ftp {
+
+   # get the parameter into a reference to a hash
+   my ($ftp_ref) = @_;
+
+   info("Connecting to server ".$ftp_ref->{'Server'});
+   info("User id: ".$ftp_ref->{'User'});
+
+   # my $ftp = Net::FTP->new($ftp_ref->{'Server'}, Debug => 1);    #or die "Can't connect: $@\n";
+   my $ftp = Net::FTP->new($ftp_ref->{'Server'});    #or die "Can't connect: $@\n";
+
+   if($ftp->login($ftp_ref->{'User'}, $ftp_ref->{'Password'}))      # or die "Couldn't login\n";
+   {
+      info("Successful login");
+   }
+   else
+   {
+      error("Unable to login to ".$ftp_ref->{'Server'}.". Aborting.");
+      return;
+   }
+
+   info("Changing directory: ".$ftp_ref->{'Directory'});
+   if (defined($ftp_ref->{'Directory'})) {
+      if($ftp->cwd($ftp_ref->{'Directory'}))                           # or die "Couldn't change directory\n";
+      {
+         info("Changed directory.");
+      }
+      else
+      {
+         error("Unable to change to directory: ".$ftp_ref->{'Directory'}.". Aborting.");
+         return;
+      }
+
+   }
+
+   if (defined($ftp_ref->{'Mode'})) {
+      my $mode = $ftp_ref->{'Mode'};
+      if ($mode eq "binary") {
+         debug("Setting mode to binary");
+         $ftp->binary();
+      } elsif ($mode eq "ascii") {
+         $ftp->ascii();
+      }
+   }
+
+   if (defined($ftp_ref->{'SiteCommand'})) {
+      debug("Sending site command ".$ftp_ref->{'SiteCommand'});
+      $ftp->site( $ftp_ref->{'SiteCommand'} );
+   }
+
+   my $method = "get";
+   if (defined($ftp_ref->{'Method'})) {
+      $method = $ftp_ref->{'Method'};
+   }
+   if ($method eq "get") {
+      # For get's, get the file into the same name but with a '.tmp' extension.
+      # When the get is complete, rename the file w/o the .tmp extension.
+      my $tmp_file = "./";
+      
+      if (defined($ftp_ref->{'TargetDir'})) {
+
+         debug("TargetDir is defined: $ftp_ref->{'TargetDir'}");
+         $tmp_file = $ftp_ref->{'TargetDir'};
+
+      } 
+      else {
+         debug("TargetDir is not defined");
+      }
+
+      if (substr($tmp_file, length($tmp_file)-1, 1) ne "/") {
+         $tmp_file = $tmp_file . "/";
+      }
+
+      my $out_file = $tmp_file . $ftp_ref->{'File'};
+      $tmp_file = $tmp_file . $ftp_ref->{'File'} . ".tmp";
+      info("Downloading file into $tmp_file");
+
+
+      if ($ftp->get($ftp_ref->{'File'}, $tmp_file))  #or die "Couldn't get file\n";
+      {
+         info("Renaming file to $out_file");
+
+         if (rename $tmp_file, $out_file) {
+            info("Renamed file to $out_file");
+
+            # At this point, the file has been downloaded. If they have specified
+            # the MoveAfterTransfer attribute, move the file
+            if ( defined($ftp_ref->{'MoveAfterTransfer'}) ) {
+               my $moveto = $ftp_ref->{'MoveAfterTransfer'};
+               if (substr($moveto, length($moveto)-1, 1) ne "/") {
+                  $moveto = $moveto . "/";
+               }
+               my $tm = localtime;
+               my $stm = sprintf("-%04d-%02d-%02d", $tm->year+1900, ($tm->mon)+1, $tm->mday);
+               $moveto = $moveto . $ftp_ref->{'File'} . $stm;
+               info("Moving server file to: ".$moveto);
+               if ($ftp->rename($ftp_ref->{'File'}, $moveto)) {
+                  debug("Successfully renamed file on server.");
+               }
+               else {
+                  debug("Unable to rename file: $!");
+               }
+            }
+            else {
+               # if MoveAfterTransfer is not specified, then how about DeleteAfterTransfer?
+               if (defined($ftp_ref->{'DeleteAfterTransfer'}) ) {
+                  if (lc($ftp_ref->{'DeleteAfterTransfer'}) eq "true") {
+                     if ( $ftp->delete($ftp_ref->{'File'}) ) {
+                        info("Deleted file [".$ftp_ref->{'File'}."] from server.");
+                     }
+                     else {
+                        error("Unable to delete file: ".$ftp_ref->{'File'});
+                     }
+                  }
+               }
+            }
+
+         }
+         else {
+            error("Unable to rename file to: $ftp_ref->{'File'}");
+         }
+      }
+      else
+      {
+         error("Unable to download file: ".$ftp_ref->{'File'}.". Aborting.");
+      }
+   } elsif ($method eq "put") {
+      if ($ftp->put($ftp_ref->{'File'})) {
+         info("Put file: $ftp_ref->{'File'}");
+      }
+      else {
+         error("Unable to upload file: $ftp_ref->{'File'}");
+      }
+   }
+}
+
+
+# Make sure a config file was specified
+if ($#ARGV < 0) {
+   print "Syntax: \n\n";
+   print "ftppoll <config file>\n\n";
+   print "Please specify configuration file\n";
+   exit;
+}
+
+# run only once
+my @ps = `ps x`;
+my $ftppoll = 0;
+foreach (@ps) {
+  if (/ftppoll/) {
+    $ftppoll++;
+  }
+}
+die "ftppoll already running: ($!)" if $ftppoll > 1;
+
+# daemonize
+use POSIX qw(setsid);
+defined(my $pid = fork) or die "Can't fork: $!";
+exit if $pid;
+setsid or die "Can't start a new session: $!";
+#print "ftppoll daemonized\n";
+
+# initialize the logging system
+
+my $essdir = "/ess/common/scr";
+our $ESSDIR;
+#print "$essdir\n";
+if (defined($ESSDIR)) {
+   $essdir = $ESSDIR;
+}
+#print "$essdir\n";
+
+
+Log::Log4perl->init_and_watch("$essdir/ftppoll.log4perl", 60);
+our $log = Log::Log4perl->get_logger("ftppoll");
+
+# SIG handlers
+$SIG{'INT'}  = 'sigint_handler';
+$SIG{'TERM'} = 'sigterm_handler';
+
+my $poll_interval = 600;
+
+while (1) {
+
+   #info("this is info logging");
+   #debug("this is debug logging");
+   #error("this is error logging");
+
+   # read config file
+   my @config;
+   #open CONFIG, "ftppoll.conf" or die "Unable to read config file: $!\n";
+   open CONFIG, $ARGV[0] or die "Unable to read config file: $!\n";
+   @config = <CONFIG>;
+   close CONFIG;
+
+   my $in_global_section = 0;
+   my @biga;
+   my %section;
+
+   my $i = -1;
+   my $section;
+
+   foreach(@config) {
+      chomp;
+      my $inline = $_;
+
+      # throw away comments
+      next if $inline =~ /^#/;
+
+      # throw away anything that is not a section or key=value pair
+      next unless $inline =~ /(^\[.*\])|(.*=.*)/ ;
+
+      # print "$inline\n";
+      $inline = trim($inline);
+
+      info($inline);
+
+      # if this is the beginning of a section...
+      if ($inline =~ /\[Section\]/ ) {
+         $in_global_section = 0;
+         $i++;
+
+         # print "i = $i\n";
+         if ($i > 0) {
+            push @biga, $section;
+         }
+         $section = { }; # re-initialize our hash
+         next;
+      }
+      elsif ($inline =~ /\[Global\]/) {
+
+         $in_global_section = 1;
+         next;
+      }
+      elsif ($in_global_section) {
+         debug ("Found Global value");
+         my ($key, $value) = split /=/, $inline;
+
+         if (trim($key) eq 'PollInterval') {
+            $poll_interval = $value;
+            debug("The poll interval is $poll_interval");
+         }
+      }
+      else {
+         # split up the key=value pair into separate scalar values
+         my ($key, $value) = split /=/, $inline;
+         # add key and value to the hash
+         $section->{trim($key)} = trim($value);
+      }
+   }
+   # add the last section if we have one
+   if( scalar($section) > 0) {
+      push @biga, $section;
+   }
+
+   my $count = $#biga+1;
+   info("Performing ftp transactions for $count ftp sites");
+
+   foreach my $the_section (@biga) {
+      # do the ftp stuff
+      do_ftp $the_section;
+   }
+   info("Sleeping $poll_interval seconds...");
+   sleep $poll_interval;
+}
+
+
+
+ 
